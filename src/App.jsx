@@ -12,6 +12,7 @@ import ChatHistory from './pages/ChatHistory'
 import DietitianChats from './pages/DietitianChats'
 import Users from './pages/Users'
 import Dietitians from './pages/Dietitians'
+import Plans from './pages/Plans'
 
 function App() {
   return (
@@ -66,9 +67,7 @@ function App() {
             <Route path="/plans" element={
               <ProtectedRoute>
                 <Layout>
-                  <div className="p-6">
-                    <h1 className="text-2xl font-bold">Plans</h1>
-                  </div>
+                  <Plans />
                 </Layout>
               </ProtectedRoute>
             } />

@@ -1,5 +1,19 @@
 import { useState, useEffect } from 'react';
-import { collection, query, where, getDocs, orderBy, onSnapshot, doc, updateDoc, serverTimestamp, increment, addDoc, getDoc, setDoc } from 'firebase/firestore';
+import { 
+  collection, 
+  query, 
+  where, 
+  getDocs, 
+  getDoc,
+  addDoc, 
+  updateDoc, 
+  doc, 
+  orderBy, 
+  onSnapshot, 
+  serverTimestamp,
+  increment,
+  writeBatch
+} from 'firebase/firestore';
 import { db } from '../firebase/config';
 import { useAuth } from '../contexts/AuthContext';
 import LoadingSpinner from '../components/LoadingSpinner';
@@ -20,6 +34,11 @@ export default function DietitianChats() {
   // Get userId and chatId from location state if navigating from Users page
   const userId = location.state?.userId;
   const chatId = location.state?.chatId;
+
+  // Plan suggestion states
+  const [showPlanModal, setShowPlanModal] = useState(false);
+  const [availablePlans, setAvailablePlans] = useState([]);
+  const [selectedPlan, setSelectedPlan] = useState(null);
 
   useEffect(() => {
     if (!currentUser?.uid) return;
@@ -110,20 +129,30 @@ export default function DietitianChats() {
       setMessages(messagesList);
       
       // Mark user messages as read
-      const batch = db.batch();
       let unreadCount = 0;
+      const updatePromises = [];
       
       snapshot.docs.forEach(doc => {
         const msgData = doc.data();
         if (msgData.senderType === 'user' && !msgData.read) {
-          batch.update(doc.ref, { read: true });
+          updatePromises.push(updateDoc(doc.ref, { read: true }));
           unreadCount++;
         }
       });
       
       if (unreadCount > 0) {
-        batch.update(doc(db, 'chats', selectedChat.id), { 'unreadCount.dietitian': 0 });
-        batch.commit();
+        // Also reset the unread count for the dietitian in the chat document
+        updatePromises.push(updateDoc(doc(db, 'chats', selectedChat.id), { 
+          'unreadCount.dietitian': 0 
+        }));
+      }
+      
+      if (updatePromises.length > 0) {
+        try {
+          await Promise.all(updatePromises);
+        } catch (error) {
+          console.error('Error updating read status:', error);
+        }
       }
     });
     
@@ -208,7 +237,8 @@ export default function DietitianChats() {
   const handleSendMessage = async (e) => {
     e.preventDefault();
     
-    if (!newMessage.trim() || !selectedChat) return;
+    // Add status check to prevent sending messages to closed chats
+    if (!newMessage.trim() || !selectedChat || selectedChat.status !== 'active') return;
     
     try {
       const messageData = {
@@ -254,6 +284,12 @@ export default function DietitianChats() {
         status: 'active'
       });
       
+      // Update local state to reflect the new status
+      setSelectedChat(prev => ({
+        ...prev,
+        status: 'active'
+      }));
+      
       // Send automatic welcome message
       const welcomeMessage = {
         text: `Hello! I'm ${currentUser.displayName || 'your dietitian'}. How can I help you today?`,
@@ -282,6 +318,12 @@ export default function DietitianChats() {
         status: 'closed'
       });
       
+      // Update local state to reflect the new status
+      setSelectedChat(prev => ({
+        ...prev,
+        status: 'closed'
+      }));
+      
       // Send automatic closing message
       const closingMessage = {
         text: 'This chat has been closed. Thank you for your consultation!',
@@ -306,6 +348,89 @@ export default function DietitianChats() {
   
   const getUserForChat = (chat) => {
     return users[chat.userId] || {};
+  };
+
+  const loadAvailablePlans = async () => {
+    try {
+      // Load user's custom plans
+      const userPlansQuery = query(
+        collection(db, 'nutrition_plans'),
+        where('dietitianId', '==', currentUser.uid),
+        orderBy('createdAt', 'desc')
+      );
+      const userPlansSnapshot = await getDocs(userPlansQuery);
+      const userPlans = userPlansSnapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        isDefault: false
+      }));
+
+      // Load default plans
+      const defaultPlansQuery = query(
+        collection(db, 'nutrition_plans'),
+        where('isDefault', '==', true),
+        orderBy('createdAt', 'desc')
+      );
+      const defaultPlansSnapshot = await getDocs(defaultPlansQuery);
+      const defaultPlans = defaultPlansSnapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+        isDefault: true
+      }));
+
+      setAvailablePlans([...userPlans, ...defaultPlans]);
+    } catch (error) {
+      console.error('Error loading plans:', error);
+    }
+  };
+
+  const handleSuggestPlan = async (plan) => {
+    if (!selectedChat || !plan) return;
+
+    try {
+      // Create a formatted message with plan details
+      const planMessage = `🎯 **Nutrition Plan Suggestion: ${plan.name}**\n\n📋 ${plan.description}\n\n📊 **7-Day Overview:**\n${plan.days.map(day => 
+        `**${day.dayName}:**\n• ${day.calories} calories\n• ${day.protein}g protein, ${day.carbs}g carbs, ${day.fat}g fat\n• ${day.waterIntake} cups water\n• ${day.sleepHours}h sleep${day.workouts.length > 0 ? `\n• Workouts: ${day.workouts.map(w => `${w.name} (${w.duration}min)`).join(', ')}` : ''}`
+      ).join('\n\n')}\n\n💡 This plan is designed to help you achieve your health goals. Would you like me to customize it further for your specific needs?`;
+
+      // Add message to Firestore
+      await addDoc(collection(db, `chats/${selectedChat.id}/messages`), {
+        text: planMessage,
+        sender: currentUser.uid,
+        senderType: 'dietitian',
+        timestamp: serverTimestamp(),
+        read: false,
+        messageType: 'plan_suggestion',
+        planId: plan.id,
+        planData: plan
+      });
+
+      // Update local messages state
+      setMessages(prev => [
+        ...prev,
+        {
+          id: `temp-${Date.now()}`,
+          text: planMessage,
+          senderType: 'dietitian',
+          timestamp: new Date(),
+          messageType: 'plan_suggestion',
+          planId: plan.id,
+          planData: plan
+        }
+      ]);
+      
+      // Update chat document
+      await updateDoc(doc(db, 'chats', selectedChat.id), {
+        lastMessage: `Suggested nutrition plan: ${plan.name}`,
+        updatedAt: serverTimestamp(),
+        'unreadCount.user': increment(1)
+      });
+
+      setShowPlanModal(false);
+      setSelectedPlan(null);
+    } catch (error) {
+      console.error('Error suggesting plan:', error);
+    }
   };
 
   if (loading) {
@@ -502,33 +627,67 @@ export default function DietitianChats() {
                 </div>
               ) : (
                 <div className="space-y-3">
-                  {messages.map(message => (
-                    <div 
-                      key={message.id}
-                      className={`flex ${message.senderType === 'dietitian' ? 'justify-end' : 'justify-start'}`}
-                    >
-                      <div className={`max-w-xs md:max-w-md rounded-lg px-4 py-2 ${
-                        message.senderType === 'dietitian' 
-                          ? 'bg-indigo-600 text-white rounded-br-none' 
-                          : 'bg-white text-gray-800 rounded-bl-none border border-gray-200'
-                      }`}>
-                        <p>{message.text}</p>
-                        <p className={`text-xs mt-1 ${message.senderType === 'dietitian' ? 'text-indigo-200' : 'text-gray-500'}`}>
-                          {message.timestamp?.toDate().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) || ''}
-                          {message.read && message.senderType === 'dietitian' && (
-                            <span className="ml-1">✓</span>
+                  {messages.map(message => {
+                    const date = message.timestamp?.toDate 
+                      ? message.timestamp.toDate() 
+                      : message.timestamp;
+                    const timeString = date 
+                      ? date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) 
+                      : '';
+
+                    return (
+                      <div 
+                        key={message.id}
+                        className={`flex ${message.senderType === 'dietitian' ? 'justify-end' : 'justify-start'}`}
+                      >
+                        <div className={`max-w-xs md:max-w-md rounded-lg px-4 py-2 ${
+                          message.senderType === 'dietitian' 
+                            ? 'bg-indigo-600 text-white rounded-br-none' 
+                            : 'bg-white text-gray-800 rounded-bl-none border border-gray-200'
+                        }`}>
+                          {message.messageType === 'plan_suggestion' ? (
+                            <div>
+                              <div className="whitespace-pre-line">{message.text}</div>
+                              {message.planData && (
+                                <div className="mt-2 p-2 bg-indigo-500 rounded text-sm">
+                                  <strong>Plan Details Available</strong>
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            <p className="whitespace-pre-line">{message.text}</p>
                           )}
-                        </p>
+                          <p className={`text-xs mt-1 ${message.senderType === 'dietitian' ? 'text-indigo-200' : 'text-gray-500'}`}>
+                            {timeString}
+                            {message.read && message.senderType === 'dietitian' && (
+                              <span className="ml-1">✓</span>
+                            )}
+                          </p>
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </div>
             
-            {/* Message input */}
-            {selectedChat.status === 'active' && (
+            {/* Message input with Suggest Plan button */}
+            {selectedChat && selectedChat.status === 'active' && (
               <div className="bg-white border-t border-gray-200 p-4">
+                <div className="flex gap-2 mb-2">
+                  <button
+                    onClick={() => {
+                      loadAvailablePlans();
+                      setShowPlanModal(true);
+                    }}
+                    className="bg-green-600 text-white px-3 py-1 rounded text-sm hover:bg-green-700 flex items-center gap-1"
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                    </svg>
+                    Suggest Plan
+                  </button>
+                </div>
                 <form onSubmit={handleSendMessage} className="flex">
                   <input
                     type="text"
@@ -567,6 +726,82 @@ export default function DietitianChats() {
           </div>
         )}
       </div>
+
+      {/* Plan Selection Modal */}
+      {showPlanModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-lg max-w-4xl w-full max-h-[80vh] overflow-y-auto">
+            <div className="p-6 border-b border-gray-200">
+              <div className="flex justify-between items-center">
+                <h2 className="text-xl font-semibold">Select a Plan to Suggest</h2>
+                <button
+                  onClick={() => setShowPlanModal(false)}
+                  className="text-gray-400 hover:text-gray-600"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+            
+            <div className="p-6">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {availablePlans.map(plan => (
+                  <div key={plan.id} className="border border-gray-200 rounded-lg p-4 hover:border-indigo-300 cursor-pointer"
+                       onClick={() => setSelectedPlan(plan)}>
+                    <div className="flex justify-between items-start mb-2">
+                      <h3 className="font-semibold text-gray-900">{plan.name}</h3>
+                      {plan.isDefault && (
+                        <span className="bg-blue-100 text-blue-800 text-xs px-2 py-1 rounded-full">
+                          Default
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-sm text-gray-600 mb-3">{plan.description}</p>
+                    
+                    <div className="grid grid-cols-2 gap-2 text-xs">
+                      <div>
+                        <span className="text-gray-500">Avg Calories:</span>
+                        <span className="font-medium ml-1">
+                          {Math.round(plan.days.reduce((sum, day) => sum + day.calories, 0) / 7)}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-gray-500">Avg Protein:</span>
+                        <span className="font-medium ml-1">
+                          {Math.round(plan.days.reduce((sum, day) => sum + day.protein, 0) / 7)}g
+                        </span>
+                      </div>
+                    </div>
+                    
+                    {selectedPlan?.id === plan.id && (
+                      <div className="mt-3 pt-3 border-t border-gray-200">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleSuggestPlan(plan);
+                          }}
+                          className="w-full bg-indigo-600 text-white py-2 rounded hover:bg-indigo-700"
+                        >
+                          Send This Plan
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+              
+              {availablePlans.length === 0 && (
+                <div className="text-center py-8 text-gray-500">
+                  <p>No plans available</p>
+                  <p className="text-sm mt-2">Create some plans first to suggest to users</p>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
