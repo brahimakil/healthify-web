@@ -32,7 +32,7 @@ export function AuthProvider({ children }) {
       
       // Create user document in Firestore with extended profile
       // Store the full photo in Firestore instead
-      await setDoc(doc(db, 'users', user.uid), {
+      const userDocData = {
         userId: user.uid,
         displayName: name,
         email: email,
@@ -46,7 +46,13 @@ export function AuthProvider({ children }) {
           areasOfExpertise: areasOfExpertise || [],
           dietApproaches: dietApproaches || []
         }
-      });
+      };
+      
+      await setDoc(doc(db, 'users', user.uid), userDocData);
+      
+      // Important: Manually set the currentUser with the role to avoid race condition
+      setCurrentUser({...user, ...userDocData});
+      
       
       return user;
     } catch (error) {

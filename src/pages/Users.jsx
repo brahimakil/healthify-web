@@ -63,10 +63,10 @@ export default function Users() {
     try {
       setLoading(true);
       
-      // Get all users except current user and other dietitians
+      // Get all users - we'll filter client-side for more control
       const usersQuery = query(
         collection(db, 'users'),
-        where('role', '!=', 'dietitian')
+        orderBy('createdAt', 'desc')
       );
       
       const snapshot = await getDocs(usersQuery);
@@ -75,7 +75,16 @@ export default function Users() {
           id: doc.id,
           ...doc.data()
         }))
-        .filter(user => user.id !== currentUser.uid);
+        .filter(user => {
+          // Exclude current user
+          if (user.id === currentUser.uid) return false;
+          
+          // Exclude dietitians (multiple role values to be safe)
+          if (user.role === 'dietitian' || user.role === 'admin') return false;
+          
+          // Include users with no role (legacy users) or explicit user/client roles
+          return true;
+        });
       
       setUsers(usersList);
       setLoading(false);
