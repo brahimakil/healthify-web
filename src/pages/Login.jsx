@@ -99,11 +99,7 @@ export default function Login() {
               </label>
             </div>
 
-            <div className="text-sm">
-              <a href="#" className={`font-medium text-${theme.colors.primary} hover:text-${theme.button.primaryHover}`}>
-                Forgot your password?
-              </a>
-            </div>
+            
           </div>
 
           <div>
